@@ -1,7 +1,6 @@
 use failure::{Error, Fail};
 use glib::object::ObjectExt;
-use gst::*;
-use gstreamer as gst;
+use gstreamer::*;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use lazy_static::lazy_static;
@@ -12,15 +11,17 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 use websocket::{self, message::OwnedMessage};
 
+use crate::media::webrtcbin::*;
+
 lazy_static! {
-    static ref RTP_CAPS_OPUS: gst::Caps = {
-        gst::Caps::new_simple(
+    static ref RTP_CAPS_OPUS: Caps = {
+        Caps::new_simple(
             "application/x-rtp",
             &[("media", &"audio"), ("encoding-name", &"OPUS"), ("payload", &(97_i32))],
         )
     };
-    static ref RTP_CAPS_VP8: gst::Caps = {
-        gst::Caps::new_simple(
+    static ref RTP_CAPS_VP8: Caps = {
+        Caps::new_simple(
             "application/x-rtp",
             &[("media", &"video"), ("encoding-name", &"VP8"), ("payload", &(96_i32))],
         )
@@ -62,8 +63,9 @@ struct AppWeak(Weak<AppInner>);
 pub struct AppInner {
     // None if we wait for a peer to appear
     pub peer_id: Option<String>,
-    pub pipeline: gst::Pipeline,
-    pub webrtcbin: gst::Element,
+    pub pipeline: Pipeline,
+    //    pub webrtcbin: WebRtcBin,
+    pub webrtcbin: Element,
     pub send_msg_tx: Mutex<mpsc::UnboundedSender<OwnedMessage>>,
     pub rtx: bool,
 }
@@ -110,7 +112,7 @@ impl Drop for AppInner {
     fn drop(&mut self) {
         // When dropping we need to ensure that the final pipeline state is
         // actually Null
-        self.pipeline.set_state(gst::State::Null).unwrap();
+        self.pipeline.set_state(State::Null).unwrap();
     }
 }
 
@@ -123,7 +125,7 @@ impl App {
     // Post an error message on the bus to asynchronously handle anything that
     // goes wrong on GStreamer threads
     fn post_error(&self, msg: &str) {
-        gst_element_error!(self.0.pipeline, gst::LibraryError::Failed, (msg));
+        gst_element_error!(self.0.pipeline, LibraryError::Failed, (msg));
     }
 
     // Send a plain text message asynchronously over the WebSocket connection.
@@ -160,9 +162,9 @@ impl App {
 
     // Once webrtcbin has create the offer SDP for us, handle it by sending it
     // to the peer via the WebSocket connection
-    fn on_offer_created(&self, promise: &gst::Promise) -> Result<(), Error> {
+    fn on_offer_created(&self, promise: &Promise) -> Result<(), Error> {
         let reply = match promise.wait() {
-            gst::PromiseResult::Replied => promise.get_reply().unwrap(),
+            PromiseResult::Replied => promise.get_reply().unwrap(),
             err => {
                 return Err(GStreamerError(format!("Offer creation future got no reponse: {:?}", err)).into());
             }
@@ -175,7 +177,7 @@ impl App {
             .expect("Invalid argument");
         self.0
             .webrtcbin
-            .emit("set-local-description", &[&offer, &None::<gst::Promise>])
+            .emit("set-local-description", &[&offer, &None::<Promise>])
             .unwrap();
 
         self.send_sdp_offer(&offer)
@@ -197,9 +199,9 @@ impl App {
 
     // Once webrtcbin has create the answer SDP for us, handle it by sending it
     // to the peer via the WebSocket connection
-    fn on_answer_created(&self, promise: &gst::Promise) -> Result<(), Error> {
+    fn on_answer_created(&self, promise: &Promise) -> Result<(), Error> {
         let reply = match promise.wait() {
-            gst::PromiseResult::Replied => promise.get_reply().unwrap(),
+            PromiseResult::Replied => promise.get_reply().unwrap(),
             err => {
                 return Err(GStreamerError(format!("Offer creation future got no reponse: {:?}", err)).into());
             }
@@ -212,7 +214,7 @@ impl App {
             .expect("Invalid argument");
         self.0
             .webrtcbin
-            .emit("set-local-description", &[&answer, &None::<gst::Promise>])
+            .emit("set-local-description", &[&answer, &None::<Promise>])
             .unwrap();
 
         self.send_sdp_answer(&answer)
@@ -225,7 +227,7 @@ impl App {
         println!("Starting negotiation");
 
         let app_clone = self.downgrade();
-        let promise = gst::Promise::new_with_change_func(move |promise| {
+        let promise = Promise::new_with_change_func(move |promise| {
             let app = upgrade_weak!(app_clone);
 
             if let Err(err) = app.on_offer_created(promise) {
@@ -235,7 +237,7 @@ impl App {
 
         self.0
             .webrtcbin
-            .emit("create-offer", &[&None::<gst::Structure>, &promise])
+            .emit("create-offer", &[&None::<Structure>, &promise])
             .unwrap();
 
         Ok(())
@@ -245,30 +247,30 @@ impl App {
     // that the peer is sending to us. Connect it to newly create sink
     // elements and converters.
     #[allow(clippy::similar_names)]
-    fn handle_media_stream(&self, pad: &gst::Pad, media_type: MediaType) -> Result<(), Error> {
+    fn handle_media_stream(&self, pad: &Pad, media_type: MediaType) -> Result<(), Error> {
         println!("Trying to handle stream {:?}", media_type);
 
         let (q, conv, sink) = match media_type {
             MediaType::Audio => {
-                let q = gst::ElementFactory::make("queue", None).unwrap();
-                let conv = gst::ElementFactory::make("audioconvert", None).unwrap();
-                let sink = gst::ElementFactory::make("autoaudiosink", None).unwrap();
-                let resample = gst::ElementFactory::make("audioresample", None).unwrap();
+                let q = ElementFactory::make("queue", None).unwrap();
+                let conv = ElementFactory::make("audioconvert", None).unwrap();
+                let sink = ElementFactory::make("autoaudiosink", None).unwrap();
+                let resample = ElementFactory::make("audioresample", None).unwrap();
 
                 self.0.pipeline.add_many(&[&q, &conv, &resample, &sink]).unwrap();
-                gst::Element::link_many(&[&q, &conv, &resample, &sink])?;
+                Element::link_many(&[&q, &conv, &resample, &sink])?;
 
                 resample.sync_state_with_parent()?;
 
                 (q, conv, sink)
             }
             MediaType::Video => {
-                let q = gst::ElementFactory::make("queue", None).unwrap();
-                let conv = gst::ElementFactory::make("videoconvert", None).unwrap();
-                let sink = gst::ElementFactory::make("autovideosink", None).unwrap();
+                let q = ElementFactory::make("queue", None).unwrap();
+                let conv = ElementFactory::make("videoconvert", None).unwrap();
+                let sink = ElementFactory::make("autovideosink", None).unwrap();
 
                 self.0.pipeline.add_many(&[&q, &conv, &sink]).unwrap();
-                gst::Element::link_many(&[&q, &conv, &sink])?;
+                Element::link_many(&[&q, &conv, &sink])?;
 
                 (q, conv, sink)
             }
@@ -286,7 +288,7 @@ impl App {
 
     // Handle a newly decoded decodebin stream and depending on its type, create
     // the relevant elements or simply ignore it
-    fn on_incoming_decodebin_stream(&self, pad: &gst::Pad) -> Result<(), Error> {
+    fn on_incoming_decodebin_stream(&self, pad: &Pad) -> Result<(), Error> {
         let caps = pad.get_current_caps().unwrap();
         let name = caps.get_structure(0).unwrap().get_name();
 
@@ -302,13 +304,13 @@ impl App {
 
     // Whenever there's a new incoming, encoded stream from the peer create a
     // new decodebin
-    fn on_incoming_stream(&self, pad: &gst::Pad) -> Result<(), Error> {
+    fn on_incoming_stream(&self, pad: &Pad) -> Result<(), Error> {
         // Early return for the source pads we're adding ourselves
-        if pad.get_direction() != gst::PadDirection::Src {
+        if pad.get_direction() != PadDirection::Src {
             return Ok(());
         }
 
-        let decodebin = gst::ElementFactory::make("decodebin", None).unwrap();
+        let decodebin = ElementFactory::make("decodebin", None).unwrap();
         let app_clone = self.downgrade();
         decodebin.connect_pad_added(move |_decodebin, pad| {
             let app = upgrade_weak!(app_clone);
@@ -343,24 +345,24 @@ impl App {
     // Create a video test source plus encoder for the video stream we send to
     // the peer
     fn add_video_source(&self) -> Result<(), Error> {
-        let videotestsrc = gst::ElementFactory::make("videotestsrc", None).unwrap();
-        let videoconvert = gst::ElementFactory::make("videoconvert", None).unwrap();
-        let queue = gst::ElementFactory::make("queue", None).unwrap();
-        let vp8enc = gst::ElementFactory::make("vp8enc", None).unwrap();
+        let videotestsrc = ElementFactory::make("videotestsrc", None).unwrap();
+        let videoconvert = ElementFactory::make("videoconvert", None).unwrap();
+        let queue = ElementFactory::make("queue", None).unwrap();
+        let vp8enc = ElementFactory::make("vp8enc", None).unwrap();
 
         videotestsrc.set_property_from_str("pattern", "ball");
         videotestsrc.set_property("is-live", &true).unwrap();
         vp8enc.set_property("deadline", &1_i64).unwrap();
 
-        let rtpvp8pay = gst::ElementFactory::make("rtpvp8pay", None).unwrap();
-        let queue2 = gst::ElementFactory::make("queue", None).unwrap();
+        let rtpvp8pay = ElementFactory::make("rtpvp8pay", None).unwrap();
+        let queue2 = ElementFactory::make("queue", None).unwrap();
 
         self.0
             .pipeline
             .add_many(&[&videotestsrc, &videoconvert, &queue, &vp8enc, &rtpvp8pay, &queue2])
             .unwrap();
 
-        gst::Element::link_many(&[&videotestsrc, &videoconvert, &queue, &vp8enc, &rtpvp8pay, &queue2])?;
+        Element::link_many(&[&videotestsrc, &videoconvert, &queue, &vp8enc, &rtpvp8pay, &queue2])?;
 
         queue2.link_filtered(&self.0.webrtcbin, Some(&*RTP_CAPS_VP8))?;
 
@@ -370,14 +372,14 @@ impl App {
     // Create a audio test source plus encoders for the audio stream we send to
     // the peer
     fn add_audio_source(&self) -> Result<(), Error> {
-        let audiotestsrc = gst::ElementFactory::make("audiotestsrc", None).unwrap();
-        let queue = gst::ElementFactory::make("queue", None).unwrap();
-        let audioconvert = gst::ElementFactory::make("audioconvert", None).unwrap();
-        let audioresample = gst::ElementFactory::make("audioresample", None).unwrap();
-        let queue2 = gst::ElementFactory::make("queue", None).unwrap();
-        let opusenc = gst::ElementFactory::make("opusenc", None).unwrap();
-        let rtpopuspay = gst::ElementFactory::make("rtpopuspay", None).unwrap();
-        let queue3 = gst::ElementFactory::make("queue", None).unwrap();
+        let audiotestsrc = ElementFactory::make("audiotestsrc", None).unwrap();
+        let queue = ElementFactory::make("queue", None).unwrap();
+        let audioconvert = ElementFactory::make("audioconvert", None).unwrap();
+        let audioresample = ElementFactory::make("audioresample", None).unwrap();
+        let queue2 = ElementFactory::make("queue", None).unwrap();
+        let opusenc = ElementFactory::make("opusenc", None).unwrap();
+        let rtpopuspay = ElementFactory::make("rtpopuspay", None).unwrap();
+        let queue3 = ElementFactory::make("queue", None).unwrap();
 
         audiotestsrc.set_property_from_str("wave", "red-noise");
         audiotestsrc.set_property("is-live", &true).unwrap();
@@ -396,7 +398,7 @@ impl App {
             ])
             .unwrap();
 
-        gst::Element::link_many(&[
+        Element::link_many(&[
             &audiotestsrc,
             &queue,
             &audioconvert,
@@ -424,7 +426,7 @@ impl App {
             self.0
                 .webrtcbin
                 .connect("on-negotiation-needed", false, move |values| {
-                    let _webrtc = values[0].get::<gst::Element>().unwrap();
+                    let _webrtc = values[0].get::<Element>().unwrap();
 
                     let app = upgrade_weak!(app_clone, None);
 
@@ -442,7 +444,7 @@ impl App {
         self.0
             .webrtcbin
             .connect("on-ice-candidate", false, move |values| {
-                let _webrtc = values[0].get::<gst::Element>().expect("Invalid argument");
+                let _webrtc = values[0].get::<Element>().expect("Invalid argument");
                 let mlineindex = values[1].get::<u32>().expect("Invalid argument");
                 let candidate = values[2].get::<String>().expect("Invalid argument");
 
@@ -513,7 +515,7 @@ impl App {
         self.0.pipeline.call_async(move |pipeline| {
             let app = upgrade_weak!(app_clone);
 
-            if let Err(err) = pipeline.set_state(gst::State::Playing) {
+            if let Err(err) = pipeline.set_state(State::Playing) {
                 app.post_error(format!("Failed to set pipeline to Playing: {:?}", err).as_str());
             }
         });
@@ -538,7 +540,7 @@ impl App {
             let answer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, ret);
             self.0
                 .webrtcbin
-                .emit("set-remote-description", &[&answer, &None::<gst::Promise>])
+                .emit("set-remote-description", &[&answer, &None::<Promise>])
                 .unwrap();
 
             Ok(None)
@@ -564,7 +566,7 @@ impl App {
             self.0.pipeline.call_async(move |pipeline| {
                 let app = upgrade_weak!(app_clone);
 
-                if let Err(err) = pipeline.set_state(gst::State::Playing) {
+                if let Err(err) = pipeline.set_state(State::Playing) {
                     app.post_error(format!("Failed to set pipeline to Playing: {:?}", err).as_str());
                     return;
                 }
@@ -573,11 +575,11 @@ impl App {
 
                 app.0
                     .webrtcbin
-                    .emit("set-remote-description", &[&offer, &None::<gst::Promise>])
+                    .emit("set-remote-description", &[&offer, &None::<Promise>])
                     .unwrap();
 
                 let app_clone = app.downgrade();
-                let promise = gst::Promise::new_with_change_func(move |promise| {
+                let promise = Promise::new_with_change_func(move |promise| {
                     let app = upgrade_weak!(app_clone);
 
                     if let Err(err) = app.on_answer_created(promise) {
@@ -587,7 +589,7 @@ impl App {
 
                 app.0
                     .webrtcbin
-                    .emit("create-answer", &[&None::<gst::Structure>, &promise])
+                    .emit("create-answer", &[&None::<Structure>, &promise])
                     .unwrap();
             });
 
@@ -642,7 +644,7 @@ impl App {
     }
 
     // Handle GStreamer messages coming from the pipeline
-    pub fn handle_pipeline_message(&self, message: &gst::Message) -> Result<Option<OwnedMessage>, Error> {
+    pub fn handle_pipeline_message(&self, message: &Message) -> Result<Option<OwnedMessage>, Error> {
         match message.view() {
             MessageView::Error(err) => Err(GStreamerError(format!(
                 "Error from element {}: {} ({})",
@@ -682,7 +684,7 @@ pub fn check_plugins() -> Result<(), Error> {
         "pulseaudio",
     ];
 
-    let registry = gst::Registry::get();
+    let registry = Registry::get();
     let missing = needed
         .iter()
         .filter(|n| registry.find_plugin(n).is_none())

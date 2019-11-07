@@ -4,8 +4,7 @@ mod media;
 use clap;
 use failure::Error;
 use futures::{compat::*, FutureExt as _, TryFutureExt as _};
-use gst::*;
-use gstreamer as gst;
+use gstreamer::*;
 use native_tls::TlsConnector;
 use std::sync::{Arc, Mutex};
 use tokio::{prelude::*, sync::mpsc};
@@ -14,7 +13,7 @@ use websocket::{self, message::OwnedMessage};
 const STUN_SERVER: &str = "stun://stun.l.google.com:19302";
 
 fn main() -> Result<(), Error> {
-    gst::init()?;
+    init()?;
 
     app::check_plugins()?;
 
@@ -23,9 +22,9 @@ fn main() -> Result<(), Error> {
     let mut runtime = tokio::runtime::Runtime::new()?;
 
     println!("Connecting to server {}", server);
-    runtime.block_on(ws_loop(server, peer_id, rtx).boxed().compat())?;
+    runtime.block_on(ws_loop(server, peer_id, rtx))?;
     // And now shut down the runtime
-    runtime.shutdown_now().wait().unwrap();
+    runtime.shutdown_now();
 
     Ok(())
 }
@@ -40,74 +39,76 @@ async fn ws_loop(server: String, peer_id: Option<String>, rtx: bool) -> Result<(
     println!("connected");
 
     // Create basic pipeline
-    let pipeline = gst::Pipeline::new(Some("main"));
-    let webrtcbin = gst::ElementFactory::make("webrtcbin", None).unwrap();
-    pipeline.add(&webrtcbin).unwrap();
+    let pipeline = Pipeline::new(Some("main"));
+    let webrtcbin = media::webrtcbin::WebRtcBin::new("webrtcbin");
 
-    webrtcbin.set_property_from_str("stun-server", STUN_SERVER);
-    webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
+    pipeline.add(webrtcbin.as_ref()).unwrap();
+
+    webrtcbin.set_bundle_policy(media::webrtcbin::RtcBundlePolicy::MaxBundle)?;
+    webrtcbin.set_stun_server(STUN_SERVER);
 
     let bus = pipeline.get_bus().unwrap();
 
     // Send our bus messages via a futures channel to be handled
     // asynchronously
-    let (send_gst_msg_tx, send_gst_msg_rx) = mpsc::unbounded_channel::<gst::Message>();
+    let (send_gst_msg_tx, send_gst_msg_rx) = mpsc::unbounded_channel::<Message>();
     let send_gst_msg_tx = Mutex::new(send_gst_msg_tx);
     bus.set_sync_handler(move |_, msg| {
         let _ = send_gst_msg_tx.lock().unwrap().try_send(msg.clone());
-        gst::BusSyncReply::Pass
+        BusSyncReply::Pass
     });
 
     // Create our application control logic
-    let (send_ws_msg_tx, send_ws_msg_rx) = mpsc::unbounded_channel::<OwnedMessage>();
-    let app = app::App(Arc::new(app::AppInner {
-        peer_id,
-        pipeline,
-        webrtcbin,
-        send_msg_tx: Mutex::new(send_ws_msg_tx),
-        rtx,
-    }));
-
-    // Start registration process with the server. This will insert
-    // a message into the send_ws_msg channel that
-    // will then be sent later
-    app.register_with_server();
-
-    // Split the stream into the receive part (stream) and send part
-    // (sink)
-    let (sink, stream) = stream.split();
-
-    // Pass the WebSocket messages to our application control logic
-    // and convert them into potential messages to send out
-    let app_clone = app.clone();
-    let ws_messages = stream
-        .map_err(|err| Error::from(app::WebSocketError(err)))
-        .and_then(move |msg| app_clone.handle_websocket_message(msg))
-        .filter_map(|msg| msg);
-
-    // Pass the GStreamer messages to the application control logic
-    // and convert them into potential messages to send out
-    let gst_messages = send_gst_msg_rx
-        .map_err(Error::from)
-        .and_then(move |msg| app.handle_pipeline_message(&msg))
-        .filter_map(|msg| msg);
-
-    // Merge the two outgoing message streams
-    let sync_outgoing_messages = gst_messages.select(ws_messages);
-
-    // And here collect all the asynchronous outgoing messages that
-    // come from other threads
-    let async_outgoing_messages = send_ws_msg_rx.map_err(Error::from);
-
-    // Merge both outgoing messages streams and send them out
-    // directly
-
-    Compat01As03::new(
-        sink.sink_map_err(|err| Error::from(app::WebSocketError(err)))
-            .send_all(sync_outgoing_messages.select(async_outgoing_messages))
-            .map(|_| ()),
-    )
-    .await
+    //    let (send_ws_msg_tx, send_ws_msg_rx) =
+    // mpsc::unbounded_channel::<OwnedMessage>();    let app =
+    // app::App(Arc::new(app::AppInner {        peer_id,
+    //        pipeline,
+    //        webrtcbin,
+    //        send_msg_tx: Mutex::new(send_ws_msg_tx),
+    //        rtx,
+    //    }));
+    //
+    //    // Start registration process with the server. This will insert
+    //    // a message into the send_ws_msg channel that
+    //    // will then be sent later
+    //    app.register_with_server();
+    //
+    //    // Split the stream into the receive part (stream) and send part
+    //    // (sink)
+    //    let (sink, stream) = stream.split();
+    //
+    //    // Pass the WebSocket messages to our application control logic
+    //    // and convert them into potential messages to send out
+    //    let app_clone = app.clone();
+    //    let ws_messages = stream
+    //        .map_err(|err| Error::from(app::WebSocketError(err)))
+    //        .and_then(move |msg| app_clone.handle_websocket_message(msg))
+    //        .filter_map(|msg| msg);
+    //
+    //    // Pass the GStreamer messages to the application control logic
+    //    // and convert them into potential messages to send out
+    //    let gst_messages = send_gst_msg_rx
+    //        .map_err(Error::from)
+    //        .and_then(move |msg| app.handle_pipeline_message(&msg))
+    //        .filter_map(|msg| msg);
+    //
+    //    // Merge the two outgoing message streams
+    //    let sync_outgoing_messages = gst_messages.select(ws_messages);
+    //
+    //    // And here collect all the asynchronous outgoing messages that
+    //    // come from other threads
+    //    let async_outgoing_messages = send_ws_msg_rx.map_err(Error::from);
+    //
+    //    // Merge both outgoing messages streams and send them out
+    //    // directly
+    //
+    //    Compat01As03::new(
+    //        sink.sink_map_err(|err| Error::from(app::WebSocketError(err)))
+    //            .send_all(sync_outgoing_messages.select(async_outgoing_messages))
+    //            .map(|_| ()),
+    //    )
+    //    .await
+    Ok(())
 }
 
 fn setup_tls_connector() -> Result<TlsConnector, native_tls::Error> {
