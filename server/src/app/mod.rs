@@ -9,7 +9,9 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
-use websocket::{self, message::OwnedMessage};
+
+use tungstenite::Error as WsError;
+use tungstenite::Message as WsMessage;
 
 use crate::media::webrtcbin::*;
 
@@ -63,17 +65,15 @@ struct AppWeak(Weak<AppInner>);
 pub struct AppInner {
     // None if we wait for a peer to appear
     pub peer_id: Option<String>,
-    pub pipeline: Pipeline,
-    //    pub webrtcbin: WebRtcBin,
-    pub webrtcbin: Element,
-    pub send_msg_tx: Mutex<mpsc::UnboundedSender<OwnedMessage>>,
+    pub webrtcbin: WebRtcBin,
+    pub send_msg_tx: Mutex<mpsc::UnboundedSender<WsMessage>>,
     pub rtx: bool,
 }
 
 // Various error types for the different errors that can happen here
 #[derive(Debug, Fail)]
 #[fail(display = "WebSocket error: {:?}", _0)]
-pub struct WebSocketError(pub websocket::WebSocketError);
+pub struct WebSocketError(WsError);
 
 #[derive(Debug, Fail)]
 #[fail(display = "GStreamer error: {:?}", _0)]
@@ -108,14 +108,6 @@ impl AppWeak {
     }
 }
 
-impl Drop for AppInner {
-    fn drop(&mut self) {
-        // When dropping we need to ensure that the final pipeline state is
-        // actually Null
-        self.pipeline.set_state(State::Null).unwrap();
-    }
-}
-
 impl App {
     // Downgrade the strong reference to a weak reference
     fn downgrade(&self) -> AppWeak {
@@ -125,7 +117,7 @@ impl App {
     // Post an error message on the bus to asynchronously handle anything that
     // goes wrong on GStreamer threads
     fn post_error(&self, msg: &str) {
-        gst_element_error!(self.0.pipeline, LibraryError::Failed, (msg));
+        gst_element_error!(self.0.webrtcbin.pipeline, LibraryError::Failed, (msg));
     }
 
     // Send a plain text message asynchronously over the WebSocket connection.
@@ -136,9 +128,9 @@ impl App {
             .send_msg_tx
             .lock()
             .unwrap()
-            .try_send(OwnedMessage::Text(msg))
+            .try_send(WsMessage::Text(msg))
             .map_err(|_| {
-                WebSocketError(websocket::WebSocketError::IoError(std::io::Error::new(
+                WebSocketError(WsError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "Connection Closed",
                 )))
@@ -158,29 +150,6 @@ impl App {
         println!("Sending SDP offer to peer: {}", message);
 
         self.send_text_msg(message)
-    }
-
-    // Once webrtcbin has create the offer SDP for us, handle it by sending it
-    // to the peer via the WebSocket connection
-    fn on_offer_created(&self, promise: &Promise) -> Result<(), Error> {
-        let reply = match promise.wait() {
-            PromiseResult::Replied => promise.get_reply().unwrap(),
-            err => {
-                return Err(GStreamerError(format!("Offer creation future got no reponse: {:?}", err)).into());
-            }
-        };
-
-        let offer = reply
-            .get_value("offer")
-            .unwrap()
-            .get::<gst_webrtc::WebRTCSessionDescription>()
-            .expect("Invalid argument");
-        self.0
-            .webrtcbin
-            .emit("set-local-description", &[&offer, &None::<Promise>])
-            .unwrap();
-
-        self.send_sdp_offer(&offer)
     }
 
     // Send our SDP answer via the WebSocket connection to the peer as JSON
@@ -214,16 +183,42 @@ impl App {
             .expect("Invalid argument");
         self.0
             .webrtcbin
+            .webrtcbin
             .emit("set-local-description", &[&answer, &None::<Promise>])
             .unwrap();
 
         self.send_sdp_answer(&answer)
     }
 
+    // Once webrtcbin has create the offer SDP for us, handle it by sending it
+    // to the peer via the WebSocket connection
+    fn on_offer_created(&self, promise: &Promise) -> Result<(), Error> {
+        let reply = match promise.wait() {
+            PromiseResult::Replied => promise.get_reply().unwrap(),
+            err => {
+                return Err(GStreamerError(format!("Offer creation future got no reponse: {:?}", err)).into());
+            }
+        };
+
+        let offer = reply
+            .get_value("offer")
+            .unwrap()
+            .get::<gst_webrtc::WebRTCSessionDescription>()
+            .expect("Invalid argument");
+        self.0
+            .webrtcbin
+            .webrtcbin
+            .emit("set-local-description", &[&offer, &None::<Promise>])
+            .unwrap();
+
+        self.send_sdp_offer(&offer)
+    }
+
     // Whenever webrtcbin tells us that (re-)negotiation is needed, simply ask
     // for a new offer SDP from webrtcbin without any customization and then
     // asynchronously send it to the peer via the WebSocket connection
     fn on_negotiation_needed(&self) -> Result<(), Error> {
+
         println!("Starting negotiation");
 
         let app_clone = self.downgrade();
@@ -236,6 +231,7 @@ impl App {
         });
 
         self.0
+            .webrtcbin
             .webrtcbin
             .emit("create-offer", &[&None::<Structure>, &promise])
             .unwrap();
@@ -257,7 +253,11 @@ impl App {
                 let sink = ElementFactory::make("autoaudiosink", None).unwrap();
                 let resample = ElementFactory::make("audioresample", None).unwrap();
 
-                self.0.pipeline.add_many(&[&q, &conv, &resample, &sink]).unwrap();
+                self.0
+                    .webrtcbin
+                    .pipeline
+                    .add_many(&[&q, &conv, &resample, &sink])
+                    .unwrap();
                 Element::link_many(&[&q, &conv, &resample, &sink])?;
 
                 resample.sync_state_with_parent()?;
@@ -269,7 +269,7 @@ impl App {
                 let conv = ElementFactory::make("videoconvert", None).unwrap();
                 let sink = ElementFactory::make("autovideosink", None).unwrap();
 
-                self.0.pipeline.add_many(&[&q, &conv, &sink]).unwrap();
+                self.0.webrtcbin.pipeline.add_many(&[&q, &conv, &sink]).unwrap();
                 Element::link_many(&[&q, &conv, &sink])?;
 
                 (q, conv, sink)
@@ -320,7 +320,7 @@ impl App {
             }
         });
 
-        self.0.pipeline.add(&decodebin).unwrap();
+        self.0.webrtcbin.pipeline.add(&decodebin).unwrap();
 
         decodebin.sync_state_with_parent()?;
 
@@ -358,13 +358,14 @@ impl App {
         let queue2 = ElementFactory::make("queue", None).unwrap();
 
         self.0
+            .webrtcbin
             .pipeline
             .add_many(&[&videotestsrc, &videoconvert, &queue, &vp8enc, &rtpvp8pay, &queue2])
             .unwrap();
 
         Element::link_many(&[&videotestsrc, &videoconvert, &queue, &vp8enc, &rtpvp8pay, &queue2])?;
 
-        queue2.link_filtered(&self.0.webrtcbin, Some(&*RTP_CAPS_VP8))?;
+        queue2.link_filtered(self.0.webrtcbin.as_ref(), Some(&*RTP_CAPS_VP8))?;
 
         Ok(())
     }
@@ -385,6 +386,7 @@ impl App {
         audiotestsrc.set_property("is-live", &true).unwrap();
 
         self.0
+            .webrtcbin
             .pipeline
             .add_many(&[
                 &audiotestsrc,
@@ -409,7 +411,7 @@ impl App {
             &queue3,
         ])?;
 
-        queue3.link_filtered(&self.0.webrtcbin, Some(&*RTP_CAPS_OPUS))?;
+        queue3.link_filtered(self.0.webrtcbin.as_ref(), Some(&*RTP_CAPS_OPUS))?;
 
         Ok(())
     }
@@ -424,6 +426,7 @@ impl App {
         if self.0.peer_id.is_some() {
             let app_clone = self.downgrade();
             self.0
+                .webrtcbin
                 .webrtcbin
                 .connect("on-negotiation-needed", false, move |values| {
                     let _webrtc = values[0].get::<Element>().unwrap();
@@ -443,6 +446,7 @@ impl App {
         let app_clone = self.downgrade();
         self.0
             .webrtcbin
+            .webrtcbin
             .connect("on-ice-candidate", false, move |values| {
                 let _webrtc = values[0].get::<Element>().expect("Invalid argument");
                 let mlineindex = values[1].get::<u32>().expect("Invalid argument");
@@ -460,7 +464,7 @@ impl App {
 
         // Whenever there is a new stream incoming from the peer, handle it
         let app_clone = self.downgrade();
-        self.0.webrtcbin.connect_pad_added(move |_webrtc, pad| {
+        self.0.webrtcbin.webrtcbin.connect_pad_added(move |_webrtc, pad| {
             let app = upgrade_weak!(app_clone);
 
             if let Err(err) = app.on_incoming_stream(pad) {
@@ -478,10 +482,7 @@ impl App {
             let transceiver = self
                 .0
                 .webrtcbin
-                .emit("get-transceiver", &[&0_i32])
-                .unwrap()
-                .unwrap()
-                .get::<glib::Object>()
+                .get_transceiver(0)
                 .unwrap();
             transceiver.set_property("do-nack", &true).unwrap();
         }
@@ -490,14 +491,14 @@ impl App {
     }
 
     // Send ID of the peer we want to talk to via the WebSocket connection
-    fn setup_call(&self, peer_id: &str) -> Result<OwnedMessage, Error> {
+    fn setup_call(&self, peer_id: &str) -> Result<WsMessage, Error> {
         println!("Setting up signalling server call with {}", peer_id);
-        Ok(OwnedMessage::Text(format!("SESSION {}", peer_id)))
+        Ok(WsMessage::Text(format!("SESSION {}", peer_id)))
     }
 
     // Once we got the HELLO message from the WebSocket connection, start
     // setting up the call
-    fn handle_hello(&self) -> Result<Option<OwnedMessage>, Error> {
+    fn handle_hello(&self) -> Result<Option<WsMessage>, Error> {
         if let Some(ref peer_id) = self.0.peer_id {
             self.setup_call(peer_id).map(Some)
         } else {
@@ -507,12 +508,12 @@ impl App {
     }
 
     // Once the session is set up correctly we start our pipeline
-    fn handle_session_ok(&self) -> Result<Option<OwnedMessage>, Error> {
+    fn handle_session_ok(&self) -> Result<Option<WsMessage>, Error> {
         self.setup_pipeline()?;
 
         // And finally asynchronously start our pipeline
         let app_clone = self.downgrade();
-        self.0.pipeline.call_async(move |pipeline| {
+        self.0.webrtcbin.pipeline.call_async(move |pipeline| {
             let app = upgrade_weak!(app_clone);
 
             if let Err(err) = pipeline.set_state(State::Playing) {
@@ -524,14 +525,14 @@ impl App {
     }
 
     // Handle errors from the peer send to us via the WebSocket connection
-    fn handle_error(&self, msg: &str) -> Result<Option<OwnedMessage>, Error> {
+    fn handle_error(&self, msg: &str) -> Result<Option<WsMessage>, Error> {
         println!("Got error message! {}", msg);
 
         Err(PeerError(msg.into()).into())
     }
 
     // Handle incoming SDP answers from the peer
-    fn handle_sdp(&self, type_: &str, sdp: &str) -> Result<Option<OwnedMessage>, Error> {
+    fn handle_sdp(&self, type_: &str, sdp: &str) -> Result<Option<WsMessage>, Error> {
         if type_ == "answer" {
             print!("Received answer:\n{}\n", sdp);
 
@@ -539,6 +540,7 @@ impl App {
                 .map_err(|_| GStreamerError("Failed to parse SDP answer".into()))?;
             let answer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, ret);
             self.0
+                .webrtcbin
                 .webrtcbin
                 .emit("set-remote-description", &[&answer, &None::<Promise>])
                 .unwrap();
@@ -563,7 +565,7 @@ impl App {
             // The pipeline needs to be started before we can create
             // an answer
             let app_clone = self.downgrade();
-            self.0.pipeline.call_async(move |pipeline| {
+            self.0.webrtcbin.pipeline.call_async(move |pipeline| {
                 let app = upgrade_weak!(app_clone);
 
                 if let Err(err) = pipeline.set_state(State::Playing) {
@@ -574,6 +576,7 @@ impl App {
                 let offer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, ret);
 
                 app.0
+                    .webrtcbin
                     .webrtcbin
                     .emit("set-remote-description", &[&offer, &None::<Promise>])
                     .unwrap();
@@ -589,6 +592,7 @@ impl App {
 
                 app.0
                     .webrtcbin
+                    .webrtcbin
                     .emit("create-answer", &[&None::<Structure>, &promise])
                     .unwrap();
             });
@@ -600,8 +604,9 @@ impl App {
     }
 
     // Handle incoming ICE candidates from the peer by passing them to webrtcbin
-    fn handle_ice(&self, sdp_mline_index: u32, candidate: &str) -> Result<Option<OwnedMessage>, Error> {
+    fn handle_ice(&self, sdp_mline_index: u32, candidate: &str) -> Result<Option<WsMessage>, Error> {
         self.0
+            .webrtcbin
             .webrtcbin
             .emit("add-ice-candidate", &[&sdp_mline_index, &candidate])
             .unwrap();
@@ -610,7 +615,7 @@ impl App {
     }
 
     // Handle messages we got from the peer via the WebSocket connection
-    fn on_message(&self, msg: &str) -> Result<Option<OwnedMessage>, Error> {
+    fn on_message(&self, msg: &str) -> Result<Option<WsMessage>, Error> {
         match msg {
             "HELLO" => self.handle_hello(),
 
@@ -634,17 +639,17 @@ impl App {
 
     // Handle WebSocket messages, both our own as well as WebSocket protocol
     // messages
-    pub fn handle_websocket_message(&self, message: OwnedMessage) -> Result<Option<OwnedMessage>, Error> {
+    pub fn handle_websocket_message(&self, message: WsMessage) -> Result<Option<WsMessage>, Error> {
         match message {
-            OwnedMessage::Close(_) => Ok(Some(OwnedMessage::Close(None))),
-            OwnedMessage::Ping(data) => Ok(Some(OwnedMessage::Pong(data))),
-            OwnedMessage::Text(msg) => self.on_message(&msg),
-            OwnedMessage::Binary(_) | OwnedMessage::Pong(_) => Ok(None),
+            WsMessage::Close(_) => Ok(Some(WsMessage::Close(None))),
+            WsMessage::Ping(data) => Ok(Some(WsMessage::Pong(data))),
+            WsMessage::Text(msg) => self.on_message(&msg),
+            WsMessage::Binary(_) | WsMessage::Pong(_) => Ok(None),
         }
     }
 
     // Handle GStreamer messages coming from the pipeline
-    pub fn handle_pipeline_message(&self, message: &Message) -> Result<Option<OwnedMessage>, Error> {
+    pub fn handle_pipeline_message(&self, message: &Message) -> Result<Option<WsMessage>, Error> {
         match message.view() {
             MessageView::Error(err) => Err(GStreamerError(format!(
                 "Error from element {}: {} ({})",

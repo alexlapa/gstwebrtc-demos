@@ -9,10 +9,12 @@ anyhow = "1.0.19"
 clap = "2.33"
 failure = "0.1.1"
 futures-preview = { version = "=0.3.0-alpha.19", features = ["compat"] }
+#futures = { version = "0.3", features = ["compat"] }
 glib = "0.8"
 gstreamer = "0.14"
 gstreamer-sdp = "0.14"
 gstreamer-webrtc = "0.14"
+gstreamer-webrtc-sys = "0.8.0"
 lazy_static = "1.0"
 native-tls = "0.2.3"
 rand = "0.7"
@@ -21,4 +23,7 @@ serde_derive = "1.0"
 serde_json = "1.0"
 thiserror = "1.0.4"
 tokio = "=0.2.0-alpha.6"
-websocket = "0.23"
+tokio-tungstenite = { git = "https://github.com/dbcfd/tokio-tungstenite.git", rev = "tokio2" }
+tungstenite = { git = "https://github.com/snapview/tungstenite-rs.git" }
+url = "2"
+websocket = "0.24"
