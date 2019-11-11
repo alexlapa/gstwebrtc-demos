@@ -8,12 +8,14 @@ use rand::Rng;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc};
+use tokio_executor::Executor;
 
 use tungstenite::Error as WsError;
 use tungstenite::Message as WsMessage;
 
 use crate::media::webrtcbin::*;
+use futures::StreamExt;
 
 lazy_static! {
     static ref RTP_CAPS_OPUS: Caps = {
@@ -138,58 +140,6 @@ impl App {
             })
     }
 
-    // Send our SDP offer via the WebSocket connection to the peer as JSON
-    // message
-    fn send_sdp_offer(&self, offer: &gst_webrtc::WebRTCSessionDescription) -> Result<(), Error> {
-        let message = serde_json::to_string(&JsonMsg::Sdp {
-            type_: "offer".to_string(),
-            sdp: offer.get_sdp().as_text().unwrap(),
-        })
-        .unwrap();
-
-        println!("Sending SDP offer to peer: {}", message);
-
-        self.send_text_msg(message)
-    }
-
-    // Send our SDP answer via the WebSocket connection to the peer as JSON
-    // message
-    fn send_sdp_answer(&self, offer: &gst_webrtc::WebRTCSessionDescription) -> Result<(), Error> {
-        let message = serde_json::to_string(&JsonMsg::Sdp {
-            type_: "answer".to_string(),
-            sdp: offer.get_sdp().as_text().unwrap(),
-        })
-        .unwrap();
-
-        println!("Sending SDP answer to peer: {}", message);
-
-        self.send_text_msg(message)
-    }
-
-    // Once webrtcbin has create the answer SDP for us, handle it by sending it
-    // to the peer via the WebSocket connection
-    fn on_answer_created(&self, promise: &Promise) -> Result<(), Error> {
-        let reply = match promise.wait() {
-            PromiseResult::Replied => promise.get_reply().unwrap(),
-            err => {
-                return Err(GStreamerError(format!("Offer creation future got no reponse: {:?}", err)).into());
-            }
-        };
-
-        let answer = reply
-            .get_value("answer")
-            .unwrap()
-            .get::<gst_webrtc::WebRTCSessionDescription>()
-            .expect("Invalid argument");
-        self.0
-            .webrtcbin
-            .webrtcbin
-            .emit("set-local-description", &[&answer, &None::<Promise>])
-            .unwrap();
-
-        self.send_sdp_answer(&answer)
-    }
-
     // Once webrtcbin has create the offer SDP for us, handle it by sending it
     // to the peer via the WebSocket connection
     fn on_offer_created(&self, promise: &Promise) -> Result<(), Error> {
@@ -211,32 +161,7 @@ impl App {
             .emit("set-local-description", &[&offer, &None::<Promise>])
             .unwrap();
 
-        self.send_sdp_offer(&offer)
-    }
-
-    // Whenever webrtcbin tells us that (re-)negotiation is needed, simply ask
-    // for a new offer SDP from webrtcbin without any customization and then
-    // asynchronously send it to the peer via the WebSocket connection
-    fn on_negotiation_needed(&self) -> Result<(), Error> {
-
-        println!("Starting negotiation");
-
-        let app_clone = self.downgrade();
-        let promise = Promise::new_with_change_func(move |promise| {
-            let app = upgrade_weak!(app_clone);
-
-            if let Err(err) = app.on_offer_created(promise) {
-                app.post_error(format!("Failed to send SDP offer: {:?}", err).as_str());
-            }
-        });
-
-        self.0
-            .webrtcbin
-            .webrtcbin
-            .emit("create-offer", &[&None::<Structure>, &promise])
-            .unwrap();
-
-        Ok(())
+        self.send_sdp_offer(offer.get_sdp().as_text().unwrap())
     }
 
     // Handle a newly decoded stream from decodebin, i.e. one of the streams
@@ -330,6 +255,32 @@ impl App {
         Ok(())
     }
 
+    // Send our SDP offer via the WebSocket connection to the peer as JSON
+    // message
+    fn send_sdp_offer(&self, offer: String) -> Result<(), Error> {
+        let message = serde_json::to_string(&JsonMsg::Sdp {
+            type_: "offer".to_string(),
+            sdp: offer,
+        }).unwrap();
+
+        println!("Sending SDP offer to peer: {}", message);
+
+        self.send_text_msg(message)
+    }
+
+    // Send our SDP answer via the WebSocket connection to the peer as JSON
+    // message
+    fn send_sdp_answer(&self, answer: String) -> Result<(), Error> {
+        let message = serde_json::to_string(&JsonMsg::Sdp {
+            type_: "answer".to_string(),
+            sdp: answer,
+        }).unwrap();
+
+        println!("Sending SDP answer to peer: {}", message);
+
+        self.send_text_msg(message)
+    }
+
     // Asynchronously send ICE candidates to the peer via the WebSocket
     // connection as a JSON message
     fn send_ice_candidate_message(&self, mlineindex: u32, candidate: String) -> Result<(), Error> {
@@ -416,9 +367,97 @@ impl App {
         Ok(())
     }
 
+
+//    // Finish creating our pipeline and actually start it once the connection
+//    // with the peer is there
+//    async fn setup_pipeline(&self) -> Result<(), Error> {
+//        println!("Start pipeline");
+//
+//        // Whenever there is a new stream incoming from the peer, handle it
+//        let app_clone = self.downgrade();
+//        self.0.webrtcbin.webrtcbin.connect_pad_added(move |_webrtc, pad| {
+//            let app = upgrade_weak!(app_clone);
+//
+//            if let Err(err) = app.on_incoming_stream(pad) {
+//                app.post_error(format!("Failed to handle incoming stream: {:?}", err).as_str());
+//            }
+//        });
+//
+//        let app_clone = self.downgrade();
+//
+//
+//        let handle_peer_events = async {
+//            while let Some(item) =  self.0.webrtcbin.subscribe().next().await {
+//                match item {
+//                    WebRtcBinEvent::OnNegotiationNeeded=> {
+//                        let app = app_clone.upgrade().unwrap();
+//
+//                        let offer = app.0.webrtcbin.create_offer().await.unwrap();
+//
+//                        app.0.webrtcbin.set_local_description(Sdp::Offer(offer.clone()));
+//
+//                        app.send_sdp_offer(offer);
+//                    },
+//                    WebRtcBinEvent::OnIceCandidate(cand) => {
+//                        let app = app_clone.upgrade().unwrap();
+//                        app.send_ice_candidate_message(cand.sdp_mline_index, cand.candidate.into());
+//                    },
+//                    WebRtcBinEvent::PadAdded(pad) => {
+//
+//                    }
+//                }
+//            };
+//        };
+//
+//        let add_sources = async {
+//
+//            // Create our audio/video sources we send to the peer
+//            self.add_video_source().unwrap();
+//            self.add_audio_source().unwrap();
+//
+//            // Enable RTX only for video, Chrome etc al fail SDP negotiation
+//            // otherwise
+//            if self.0.rtx {
+//                let transceiver = self
+//                    .0
+//                    .webrtcbin
+//                    .get_transceiver(0)
+//                    .unwrap();
+//                transceiver.set_property("do-nack", &true).unwrap();
+//            }
+//        };
+//
+//        futures::join!(handle_peer_events, add_sources);
+//
+//        Ok(())
+//    }
+
+    fn on_negotiation_needed(&self) -> Result<(), Error> {
+
+        println!("Starting negotiation");
+
+        let app_clone = self.downgrade();
+        let promise = Promise::new_with_change_func(move |promise| {
+            let app = upgrade_weak!(app_clone);
+
+            if let Err(err) = app.on_offer_created(promise) {
+                app.post_error(format!("Failed to send SDP offer: {:?}", err).as_str());
+            }
+        });
+
+        self.0
+            .webrtcbin
+            .webrtcbin
+            .emit("create-offer", &[&None::<Structure>, &promise])
+            .unwrap();
+
+        Ok(())
+    }
+
+
     // Finish creating our pipeline and actually start it once the connection
     // with the peer is there
-    fn setup_pipeline(&self) -> Result<(), Error> {
+    async fn setup_pipeline(&self) -> Result<(), Error> {
         println!("Start pipeline");
 
         // Whenever (re-)negotiation is needed, do so but this is only needed if
@@ -433,9 +472,42 @@ impl App {
 
                     let app = upgrade_weak!(app_clone, None);
 
-                    if let Err(err) = app.on_negotiation_needed() {
-                        app.post_error(format!("Failed to start negotiation: {:?}", err).as_str());
-                    }
+                    tokio::runtime::current_thread::Runtime::new().unwrap().block_on(async move {
+//                        let promise = Promise::new_with_change_func(move |promise| {
+//                            println!("qweeqweqweqw");
+//                        });
+//
+//                        app.0
+//                            .webrtcbin
+//                            .webrtcbin
+//                            .emit("create-offer", &[&None::<Structure>, &promise])
+//                            .unwrap();
+
+                        let offer = app.0.webrtcbin.create_offer().await.unwrap();
+
+
+
+//                        let promise = Promise::new_with_change_func(move |promise| {
+//                            println!("qweeqweqweqw");
+//                        });
+//
+//                        app.0
+//                            .webrtcbin
+//                            .webrtcbin
+//                            .emit("create-offer", &[&None::<Structure>, &promise])
+//                            .unwrap();
+
+//                        println!("111");
+//                        let offer = app.0.webrtcbin.create_offer().await.unwrap();
+//                        println!("222");
+
+
+
+//                        app.0.webrtcbin.set_local_description(Sdp::Offer(offer.clone()));
+//                        println!("333");
+//                        app.send_sdp_offer(offer);
+//                        println!("444");
+                    });
 
                     None
                 })
@@ -508,8 +580,8 @@ impl App {
     }
 
     // Once the session is set up correctly we start our pipeline
-    fn handle_session_ok(&self) -> Result<Option<WsMessage>, Error> {
-        self.setup_pipeline()?;
+    async fn handle_session_ok(&self) -> Result<Option<WsMessage>, Error> {
+        self.setup_pipeline().await?;
 
         // And finally asynchronously start our pipeline
         let app_clone = self.downgrade();
@@ -532,21 +604,15 @@ impl App {
     }
 
     // Handle incoming SDP answers from the peer
-    fn handle_sdp(&self, type_: &str, sdp: &str) -> Result<Option<WsMessage>, Error> {
+    async fn handle_sdp(&self, type_: &str, sdp: &str) -> Result<Option<WsMessage>, Error> {
         if type_ == "answer" {
             print!("Received answer:\n{}\n", sdp);
 
-            let ret = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())
-                .map_err(|_| GStreamerError("Failed to parse SDP answer".into()))?;
-            let answer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, ret);
-            self.0
-                .webrtcbin
-                .webrtcbin
-                .emit("set-remote-description", &[&answer, &None::<Promise>])
-                .unwrap();
+            self.0.webrtcbin.set_remote_description(Sdp::Answer(sdp.to_owned())).await;
 
             Ok(None)
         } else if type_ == "offer" {
+
             print!("Received offer:\n{}\n", sdp);
 
             // FIXME: We need to do negotiation here based on what the peer
@@ -555,47 +621,17 @@ impl App {
             // understand have to be removed, and similarly we have to negotiate
             // the codecs.
 
-            // Need to start the pipeline as a first step here
-            self.setup_pipeline()?;
+            self.setup_pipeline().await?;
 
-            let ret = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())
-                .map_err(|_| GStreamerError("Failed to parse SDP offer".into()))?;
+            let sdp = Sdp::Offer(sdp.to_owned());
 
-            // And then asynchronously start our pipeline and do the next steps.
-            // The pipeline needs to be started before we can create
-            // an answer
-            let app_clone = self.downgrade();
-            self.0.webrtcbin.pipeline.call_async(move |pipeline| {
-                let app = upgrade_weak!(app_clone);
+            self.0.webrtcbin.set_remote_description(sdp).await;
 
-                if let Err(err) = pipeline.set_state(State::Playing) {
-                    app.post_error(format!("Failed to set pipeline to Playing: {:?}", err).as_str());
-                    return;
-                }
+            let answer = self.0.webrtcbin.create_answer().await.unwrap();
 
-                let offer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, ret);
+            self.0.webrtcbin.set_local_description(Sdp::Answer(answer.clone())).await;
 
-                app.0
-                    .webrtcbin
-                    .webrtcbin
-                    .emit("set-remote-description", &[&offer, &None::<Promise>])
-                    .unwrap();
-
-                let app_clone = app.downgrade();
-                let promise = Promise::new_with_change_func(move |promise| {
-                    let app = upgrade_weak!(app_clone);
-
-                    if let Err(err) = app.on_answer_created(promise) {
-                        app.post_error(format!("Failed to send SDP answer: {:?}", err).as_str());
-                    }
-                });
-
-                app.0
-                    .webrtcbin
-                    .webrtcbin
-                    .emit("create-answer", &[&None::<Structure>, &promise])
-                    .unwrap();
-            });
+            self.send_sdp_answer(answer);
 
             Ok(None)
         } else {
@@ -604,34 +640,30 @@ impl App {
     }
 
     // Handle incoming ICE candidates from the peer by passing them to webrtcbin
-    fn handle_ice(&self, sdp_mline_index: u32, candidate: &str) -> Result<Option<WsMessage>, Error> {
+    async fn handle_ice(&self, sdp_mline_index: u32, candidate: &str) -> Result<Option<WsMessage>, Error> {
         self.0
             .webrtcbin
-            .webrtcbin
-            .emit("add-ice-candidate", &[&sdp_mline_index, &candidate])
+            .add_ice_candidate(IceCandidate{ sdp_mline_index, candidate: candidate.into() })
             .unwrap();
 
         Ok(None)
     }
 
     // Handle messages we got from the peer via the WebSocket connection
-    fn on_message(&self, msg: &str) -> Result<Option<WsMessage>, Error> {
+    async fn on_message(&self, msg: &str) -> Result<Option<WsMessage>, Error> {
         match msg {
             "HELLO" => self.handle_hello(),
-
-            "SESSION_OK" => self.handle_session_ok(),
-
+            "SESSION_OK" => self.handle_session_ok().await,
             x if x.starts_with("ERROR") => self.handle_error(msg),
-
             _ => {
                 let json_msg: JsonMsg = serde_json::from_str(msg)?;
 
                 match json_msg {
-                    JsonMsg::Sdp { type_, sdp } => self.handle_sdp(&type_, &sdp),
+                    JsonMsg::Sdp { type_, sdp } => self.handle_sdp(&type_, &sdp).await,
                     JsonMsg::Ice {
                         sdp_mline_index,
                         candidate,
-                    } => self.handle_ice(sdp_mline_index, &candidate),
+                    } => self.handle_ice(sdp_mline_index, &candidate).await,
                 }
             }
         }
@@ -639,11 +671,11 @@ impl App {
 
     // Handle WebSocket messages, both our own as well as WebSocket protocol
     // messages
-    pub fn handle_websocket_message(&self, message: WsMessage) -> Result<Option<WsMessage>, Error> {
+    pub async fn handle_websocket_message(&self, message: WsMessage) -> Result<Option<WsMessage>, Error> {
         match message {
             WsMessage::Close(_) => Ok(Some(WsMessage::Close(None))),
             WsMessage::Ping(data) => Ok(Some(WsMessage::Pong(data))),
-            WsMessage::Text(msg) => self.on_message(&msg),
+            WsMessage::Text(msg) => self.on_message(&msg).await,
             WsMessage::Binary(_) | WsMessage::Pong(_) => Ok(None),
         }
     }

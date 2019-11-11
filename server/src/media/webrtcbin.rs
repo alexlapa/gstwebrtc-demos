@@ -8,6 +8,7 @@ use gstreamer::*;
 use gstreamer_sdp::*;
 use gstreamer_webrtc::*;
 use thiserror::Error;
+use std::borrow::Cow;
 
 static ELEMENT_NAME: &str = "webrtcbin";
 
@@ -65,9 +66,9 @@ impl Into<WebRTCSessionDescription> for Sdp {
 }
 
 #[derive(Debug)]
-pub struct IceCandidate {
+pub struct IceCandidate<'a> {
     pub sdp_mline_index: u32,
-    pub candidate: String,
+    pub candidate: Cow<'a, str>,
 }
 
 #[derive(Debug)]
@@ -77,9 +78,11 @@ pub struct WebRtcBin {
 }
 
 #[derive(Debug)]
-pub enum WebRtcBinEvents {
+pub enum WebRtcBinEvent<'a, 'b> {
     OnNegotiationNeeded,
-    OnIceCandidate(IceCandidate),
+    OnIceCandidate(IceCandidate<'a>),
+    // TODO
+    PadAdded(&'b Pad),
 }
 
 impl WebRtcBin {
@@ -129,6 +132,7 @@ impl WebRtcBin {
         let (tx, rx) = oneshot::channel();
 
         let promise = Promise::new_with_change_func(move |promise: &Promise| {
+            println!("AZAZAZAZAZZAAZ");
             tx.send(handle_create_offer(promise)).unwrap();
         });
 
@@ -191,10 +195,13 @@ impl WebRtcBin {
     }
 
     pub fn add_ice_candidate(&self, ice_candidate: IceCandidate) -> Result<(), BoolError> {
+
+
+        let candidate:&str = &ice_candidate.candidate;
         self.webrtcbin
             .emit(
                 SIGS_ADD_ICE_CANDIDATE,
-                &[&ice_candidate.sdp_mline_index, &ice_candidate.candidate],
+                &[&ice_candidate.sdp_mline_index, &candidate],
             )
             .map(|_| ())
     }
@@ -221,29 +228,34 @@ impl WebRtcBin {
             .get::<WebRTCRTPTransceiver>()
     }
 
-    pub fn subscribe(&self) -> LocalBoxStream<'static, WebRtcBinEvents> {
+    pub fn subscribe(&self) -> LocalBoxStream<'static, WebRtcBinEvent> {
         let (tx, rx) = mpsc::unbounded();
 
         let tx_clone = tx.clone();
         self.webrtcbin
             .connect(SIGS_ON_NEGOTIATION_NEEDED, false, move |values| {
-                tx_clone.unbounded_send(WebRtcBinEvents::OnNegotiationNeeded);
+                tx_clone.unbounded_send(WebRtcBinEvent::OnNegotiationNeeded);
                 None
             })
             .unwrap();
 
+        let tx_clone = tx.clone();
         self.webrtcbin
             .connect(SIGS_ON_ICE_CANDIDATE, false, move |values| {
                 let sdp_mline_index = values[1].get::<u32>().unwrap();
                 let candidate = values[2].get::<String>().unwrap();
 
-                tx.unbounded_send(WebRtcBinEvents::OnIceCandidate(IceCandidate {
+                tx_clone.unbounded_send(WebRtcBinEvent::OnIceCandidate(IceCandidate {
                     sdp_mline_index,
-                    candidate,
+                    candidate:candidate.into(),
                 }));
                 None
             })
             .unwrap();
+
+//        self.webrtcbin.connect_pad_added(move |_, pad| {
+//            tx_clone.unbounded_send(WebRtcBinEvent::PadAdded(pad));
+//        });
 
         Box::pin(rx)
     }
@@ -338,7 +350,7 @@ mod tests {
 
         while let Some(event) = events.next().await {
             match event {
-                WebRtcBinEvents::OnIceCandidate(IceCandidate) => {
+                WebRtcBinEvent::OnIceCandidate(IceCandidate) => {
                     break;
                 }
                 _ => {}

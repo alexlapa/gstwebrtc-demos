@@ -9,7 +9,6 @@ anyhow = "1.0.19"
 clap = "2.33"
 failure = "0.1.1"
 futures-preview = { version = "=0.3.0-alpha.19", features = ["compat"] }
-#futures = { version = "0.3", features = ["compat"] }
 glib = "0.8"
 gstreamer = "0.14"
 gstreamer-sdp = "0.14"
@@ -23,6 +22,7 @@ serde_derive = "1.0"
 serde_json = "1.0"
 thiserror = "1.0.4"
 tokio = "=0.2.0-alpha.6"
+tokio-executor = "=0.2.0-alpha.6"
 tokio-tungstenite = { git = "https://github.com/dbcfd/tokio-tungstenite.git", rev = "tokio2" }
 tungstenite = { git = "https://github.com/snapview/tungstenite-rs.git" }
 url = "2"

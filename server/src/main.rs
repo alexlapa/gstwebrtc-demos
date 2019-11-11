@@ -40,6 +40,7 @@ fn main() -> Result<(), Error> {
 
 #[allow(clippy::similar_names)]
 async fn ws_loop(server: String, peer_id: Option<String>, rtx: bool) -> Result<(), Error> {
+    println!("{:?}", std::thread::current());
     let url = url::Url::parse(&server)?;
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
     let (ws_w, ws_r) = ws.split();
@@ -86,7 +87,7 @@ async fn ws_loop(server: String, peer_id: Option<String>, rtx: bool) -> Result<(
             // Pass the WebSocket messages to our application control logic
             // and convert them into potential messages to send out
             ws_msg = ws_r.select_next_some() => {
-                app.handle_websocket_message(ws_msg?)?
+                app.handle_websocket_message(ws_msg?).await?
             },
             // Pass the GStreamer messages to the application control logic
             // and convert them into potential messages to send out
@@ -116,6 +117,7 @@ fn parse_args() -> (String, Option<String>, bool) {
                 .help("String ID of the peer to connect to")
                 .long("peer-id")
                 .required(false)
+                .default_value("1")
                 .takes_value(true),
         )
         .arg(
